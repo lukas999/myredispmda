@@ -32,10 +32,13 @@
 #
 #       keyspace_name = db0
 #
-#     - host = <hostname or IP address>:<port number> - redis host
-#       Example: Enabling four redis instances running on localhost
+#     - host = <hostname or IP address>:<port number>[:<auth password>]
+#       - redis host
 #
-#       host=localhost:6380
+#       Example: Enabling four redis instances running on localhost, the first
+#       one has Redis authentication enabled (AUTH password is "p4ssw0rd")
+#
+#       host=localhost:6380:p4ssw0rd
 #       host=localhost:6381
 #       host=localhost:6382
 #       host=localhost:6383
@@ -687,12 +690,13 @@ sub load_config {
             mydebug("#$lineno: Skipping line '$aline'");
 
             next
-        } elsif ($aline =~ /\A\s*host\s*=\s*(\S+):(\d+)\s*\Z/) {
-            mydebug("#$lineno: host: '$1', port: '$2' from '$aline'");
+        } elsif ($aline =~ /\A\s*host\s*=\s*(\S+):(\d+)(?::(\S+))?\s*\Z/) {
+            mydebug("#$lineno: host: '$1', port: '$2', pass: '$3' from '$aline'");
 
             $refh_res->{hosts}->{join(':',$1,$2)} = { id   => $host_id++,
                                                       host => $1,
-                                                      port => $2 };
+                                                      port => $2,
+                                                      pass => $3 };
         } elsif ($aline =~ /\A\s*db_name\s*=\s*(\S+)\s*\Z/) {
             mydebug("#$lineno: keyspace: '$1' from '$aline'");
 
@@ -721,15 +725,16 @@ sub load_config {
 
     foreach my $host_port (sort keys %{$refh_res->{hosts}}) {
         my ($host,$port);
+        my $pass = $refh_res->{hosts}->{$host_port}->{pass};
 
         unless (($host,$port) = ($host_port =~ /(\S+):(\d+)/)) {
             $err_count++;
 
-            $pmda->err("Failed to detect host name/address and port number from '$host_port'");
+            $pmda->err("Failed to detect host name/address, port number and, optionally, the auth password from '$host_port'");
             next;
         }
 
-        mydebug("Detected - host: '$host', port: '$port'");
+        mydebug("Detected - host: '$host', port: '$port', auth password: '$pass'");
 
         $err_count++,$pmda->err("Failed to gethostbyname($host)")
             unless $host and gethostbyname $host;
@@ -793,7 +798,7 @@ sub myredis_fetch_callback {
         return (PM_ERR_PMID, 0)
     }
 
-    # Get redis hostname and port number from config
+    # Get redis hostname, port number and, optionally, the auth password from config
     my @host_ports = grep {$cfg{loaded}{hosts}{$_}->{id} == $inst} keys %{$cfg{loaded}{hosts}};
 
     mydebug(Data::Dumper->Dump([\@host_ports,
@@ -807,11 +812,12 @@ sub myredis_fetch_callback {
         unless @host_ports;
 
     my ($host,$port) = split /:/,$host_ports[0];
+    my $pass = $cfg{loaded}{hosts}{$host_ports[0]}->{pass};
 
     warn "Assertion error - no host:port detected in '$host_ports[0]'"
         unless $host and $port;
 
-    mydebug("Host: '$host', port: '$port'");
+    mydebug("Host: '$host', port: '$port', pass: '$pass'");
 
     # Fetch redis info
     my ($refh_redis_info,$refh_inst_keys);
@@ -824,7 +830,7 @@ sub myredis_fetch_callback {
     } else {
         mydebug("Actual data not found, refetching");
 
-        ($refh_redis_info,$refh_inst_keys) = get_redis_data($host,$port);
+        ($refh_redis_info,$refh_inst_keys) = get_redis_data($host,$port,$pass);
 
         unless (defined $refh_redis_info) {
             $pmda->err("Reading from socket ($host:$port) timeouted after $cfg{recv_wait_sec} seconds");
@@ -888,10 +894,10 @@ sub myredis_fetch_callback {
 }
 
 sub get_redis_data {
-    my ($host,$port) = @_;
+    my ($host,$port,$pass) = @_;
     my ($refh_keys,$refh_inst_keys);
 
-    mydebug("Opening socket to host:'$host', port:'$port'");
+    mydebug("Opening socket to host:'$host', port:'$port', pass:'$pass'");
 
     # Enable autoflush
     local $| = 1;
@@ -906,9 +912,13 @@ sub get_redis_data {
         return undef
     }
 
-    my $size = $socket->send("INFO\r\n");
-
-    mydebug("Sent INFO request with $size bytes");
+    if (defined $pass and length($pass)) {
+      my $size = $socket->send("AUTH $pass\r\nINFO\r\nQUIT\r\n");
+      mydebug("Sent AUTH + INFO request with $size bytes");
+    } else {
+      my $size = $socket->send("INFO\r\nQUIT\r\n");
+      mydebug("Sent INFO request with $size bytes");
+    }
 
     my ($cur_resp,$resp,$header,$len) = ("","","",0);
 
@@ -925,24 +935,21 @@ sub get_redis_data {
         while ($socket->recv($cur_resp,$cfg{max_recv_len}),$cur_resp) {
             $resp .= $cur_resp;
 
-            if (not $len and not (($header,$len) = ($resp =~ /\A(\$(\d+)[\r\n]+)/))) {
+            if (defined $pass and length($pass)) {
+              # Wait for OK status reply, then payload
+              if (not $len and not (($header,$len) = ($resp =~ /\A(\+OK\r\n\$(\d+)[\r\n]+)/))) {
                 mydebug("... still do not have enough data to detect header");
-
                 next;
+              }
+            } else {
+              # Wait for payload
+              if (not $len and not (($header,$len) = ($resp =~ /\A(\$(\d+)[\r\n]+)/))) {
+                mydebug("... still do not have enough data to detect header");
+                next;
+              }
             }
 
             mydebug("Len: $len, header: '$header', response length: " . length($resp));
-
-            if ($len) {
-                # Check length = detected length - header length - 2 Bytes for final /r/n
-                if ($header and (length($resp) - length($header) - 2 == $len)) {
-                    mydebug("Got the complete response");
-                    last;
-                }
-
-                mydebug("Still expecting some more data");
-            }
-
             mydebug(Data::Dumper->Dump([\$cur_resp,$!],[q(cur_resp !)]));
         }
 
@@ -974,6 +981,10 @@ sub get_redis_data {
         # Skip empty lines, comments and strange first line line '$1963'
         if ($ans =~ /\A#|\A\s*\Z|\A\$/) {
             mydebug("... comment or empty line");
+
+            next
+        } elsif ($ans eq "+OK") {
+            mydebug("... OK status reply");
 
             next
         }
